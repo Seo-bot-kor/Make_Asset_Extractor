@@ -70,7 +70,18 @@ VIRNECT 의 AR/XR 프로젝트 파일에서 에셋을 추출합니다.
         ..._normal.png            (노멀맵)
         ..._emissive.png          (이미시브)
         ..._occlusion.png         (앰비언트 오클루전)
+     videos/ 폴더 : 영상(mp4 등)이 원본 이름으로 추출됩니다.
+     audio/ 폴더 : 오디오(mp3 등)가 원본 이름으로 추출됩니다.
+     templates/ 폴더 : 입력 파일과 같은 폴더에 .MakeTemplate 파일이
+                       있으면 원형 그대로 이 폴더에 보관됩니다.
      _metadata/scene.gltf.json 에 전체 씬 구조(노드/머티리얼)가 들어있습니다.
+
+  [ .MakeTemplate 파일 ]
+     .make 에서 에셋/기능을 묶어 별도 관리하는 파일입니다.
+     - 추출할 .make 와 같은 폴더에 .MakeTemplate 가 있으면, 추출 시
+       templates/ 폴더에 원형 그대로 함께 보관됩니다.
+     - .MakeTemplate 파일을 직접 골라 넣어도 templates/ 에 그대로 보관됩니다.
+     - 창의 ".MakeTemplate: 원형 그대로 보관 / 보관 안 함" 으로 끌 수 있습니다.
 
      * 각 .glb 는 표준 glTF 2.0 으로 저장되어 Blender 등에서 바로 열립니다.
        (원본 .make 는 버전 표기가 비표준이라 그대로는 Blender 가 거부하는데,

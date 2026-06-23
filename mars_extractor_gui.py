@@ -15,7 +15,7 @@ VIRNECT MAKE / ARES (.mars) AR 프로젝트 파일에서 에셋(3D 모델, 이�
 """
 
 # 이 숫자가 자동 업데이트의 기준입니다. 코드를 고칠 때마다 1씩 올리세요.
-APP_VERSION = 5
+APP_VERSION = 7
 
 import os
 import sys
@@ -172,6 +172,34 @@ def safe_name(path_str):
     base = re.split(r'[\\/]', path_str)[-1].strip()
     base = re.sub(r'[<>:"|?*\x00-\x1f]', '_', base)
     return base or 'unnamed'
+
+
+def copy_sidecar_templates(input_path, out_dir, log_cb=None):
+    """
+    입력 파일과 같은 폴더에 있는 .MakeTemplate 파일들을
+    원형 그대로 out_dir/templates/ 에 복사한다.
+    """
+    src_dir = os.path.dirname(os.path.abspath(input_path))
+    try:
+        names = os.listdir(src_dir)
+    except Exception:
+        return 0
+    targets = [n for n in names if n.lower().endswith('.maketemplate')]
+    if not targets:
+        return 0
+    tdir = os.path.join(out_dir, 'templates')
+    os.makedirs(tdir, exist_ok=True)
+    import shutil
+    cnt = 0
+    for n in targets:
+        try:
+            shutil.copy2(os.path.join(src_dir, n), os.path.join(tdir, n))
+            cnt += 1
+        except Exception:
+            pass
+    if cnt and log_cb:
+        log_cb(f".MakeTemplate {cnt}개를 templates/ 에 보관")
+    return cnt
 
 
 def read_top_chunks(data):
@@ -830,6 +858,56 @@ def extract_glb(path, out_dir, progress_cb=None, log_cb=None, extract_textures=T
         if progress_cb:
             progress_cb(i, total)
 
+    # --- 영상/오디오 추출 (VIRNECT extras.media → accessor → BIN) ---
+    media_list = gltf.get('extras', {}).get('media', [])
+    if media_list:
+        log(f"미디어(영상/오디오) {len(media_list)}개 추출 중...")
+        # ResourceID → 원본 파일명(OriginPath) 매핑 (이름 살리기용)
+        name_by_rid = {}
+        er = gltf.get('extensions', {}).get('VNT_ExternalResources', {})
+        for it in er.get('ResourceItems', []):
+            rid = it.get('ResourceID')
+            op = it.get('OriginPath')
+            if rid and op:
+                name_by_rid[rid] = re.split(r'[\\/]', op)[-1]
+
+        mext = {'.mp4': 'videos', '.mov': 'videos', '.webm': 'videos',
+                '.mp3': 'audio', '.wav': 'audio', '.ogg': 'audio', '.m4a': 'audio'}
+        mused = set()
+        for mi, m in enumerate(media_list):
+            aid = m.get('AccessorId')
+            ext = (m.get('extension') or '').lower()
+            if aid is None or aid >= len(gltf.get('accessors', [])):
+                continue
+            a = gltf['accessors'][aid]
+            bvi = a.get('bufferView')
+            if bvi is None:
+                continue
+            view = bv[bvi]
+            start = bin_off + view.get('byteOffset', 0)
+            ln = view['byteLength']
+            blob = data[start:start + ln]
+            if not ext:
+                ext = sniff_ext(blob) or '.bin'
+            sub = mext.get(ext, 'other')
+            mdir = os.path.join(out_dir, sub)
+            os.makedirs(mdir, exist_ok=True)
+            # 이름: OriginPath 기반, 없으면 ResourceID
+            raw = name_by_rid.get(m.get('ResourceID')) or (m.get('ResourceID') or f'media_{mi}')
+            raw = re.sub(r'[<>:"|?*\\/\x00-\x1f]', '_', str(raw)).strip()
+            if not raw.lower().endswith(ext):
+                raw = os.path.splitext(raw)[0] + ext
+            fn = raw
+            while fn.lower() in mused:
+                fn = '_' + fn
+            mused.add(fn.lower())
+            with open(os.path.join(mdir, fn), 'wb') as wf:
+                wf.write(blob)
+            count += 1
+            total_bytes += len(blob)
+            summary[ext] = summary.get(ext, 0) + 1
+        log("미디어 추출 완료")
+
     # 메타데이터: glTF JSON 통째로 저장 (씬 구조/노드/머티리얼 분석용)
     meta_dir = os.path.join(out_dir, '_metadata')
     os.makedirs(meta_dir, exist_ok=True)
@@ -849,13 +927,35 @@ def extract_glb(path, out_dir, progress_cb=None, log_cb=None, extract_textures=T
     return count, total_bytes, summary
 
 
-def extract_any(path, out_dir, progress_cb=None, log_cb=None, extract_textures=True):
-    """확장자/매직으로 .mars 와 .make(glTF) 자동 판별 후 추출."""
+def extract_any(path, out_dir, progress_cb=None, log_cb=None,
+                extract_textures=True, keep_templates=True):
+    """확장자/매직으로 .mars / .make / .MakeTemplate 자동 판별 후 처리."""
+    # .MakeTemplate 를 직접 넣은 경우: 원형 그대로 templates/ 에 보관
+    if path.lower().endswith('.maketemplate'):
+        import shutil
+        tdir = os.path.join(out_dir, 'templates')
+        os.makedirs(tdir, exist_ok=True)
+        fn = os.path.basename(path)
+        shutil.copy2(path, os.path.join(tdir, fn))
+        if log_cb:
+            log_cb(f".MakeTemplate 원형 보관: templates/{fn}")
+        size = os.path.getsize(path)
+        return (1, size, {'.MakeTemplate': 1})
+
     with open(path, 'rb') as f:
         head = f.read(4)
     if head == b'glTF':
-        return extract_glb(path, out_dir, progress_cb, log_cb, extract_textures)
-    return extract_mars(path, out_dir, progress_cb, log_cb, extract_textures)
+        result = extract_glb(path, out_dir, progress_cb, log_cb, extract_textures)
+    else:
+        result = extract_mars(path, out_dir, progress_cb, log_cb, extract_textures)
+    # 입력 파일과 같은 폴더에 .MakeTemplate 가 있으면 함께 원형 보관
+    if keep_templates:
+        n = copy_sidecar_templates(path, out_dir, log_cb)
+        if n:
+            count, total_bytes, summary = result
+            summary['.MakeTemplate'] = n
+            result = (count, total_bytes, summary)
+    return result
 
 
 def open_folder(path):
@@ -926,6 +1026,16 @@ class App:
                        variable=self.tex_var,
                        font=("Malgun Gothic", 9)).pack(pady=(2, 0))
 
+        # 옵션: .MakeTemplate 처리 방식
+        self.tmpl_var = tk.StringVar(value='keep')
+        tf = tk.Frame(root)
+        tf.pack(pady=(0, 2))
+        tk.Label(tf, text=".MakeTemplate:", font=("Malgun Gothic", 9)).grid(row=0, column=0, padx=(0, 6))
+        tk.Radiobutton(tf, text="원형 그대로 보관", value='keep',
+                       variable=self.tmpl_var, font=("Malgun Gothic", 9)).grid(row=0, column=1)
+        tk.Radiobutton(tf, text="보관 안 함", value='skip',
+                       variable=self.tmpl_var, font=("Malgun Gothic", 9)).grid(row=0, column=2)
+
         # 진행률
         self.progress = ttk.Progressbar(root, length=520, mode="determinate")
         self.progress.pack(**pad)
@@ -938,7 +1048,7 @@ class App:
     # --- 이벤트 ---
     def on_drop(self, event):
         path = event.data.strip().strip('{}')
-        if path.lower().endswith(('.mars', '.make', '.glb', '.gltf')):
+        if path.lower().endswith(('.mars', '.make', '.glb', '.gltf', '.maketemplate')):
             self.set_file(path)
         else:
             messagebox.showwarning("형식 오류", ".mars 또는 .make 파일을 넣어주세요.")
@@ -946,7 +1056,7 @@ class App:
     def select_file(self):
         path = filedialog.askopenfilename(
             title="파일 선택 (.mars / .make)",
-            filetypes=[("AR/XR 프로젝트", "*.mars *.make *.glb *.gltf"),
+            filetypes=[("AR/XR 프로젝트", "*.mars *.make *.glb *.gltf *.MakeTemplate"),
                        ("모든 파일", "*.*")])
         if path:
             self.set_file(path)
@@ -984,7 +1094,8 @@ class App:
                     self.mars_path, out_dir,
                     progress_cb=lambda d, t: self.root.after(0, self.set_progress, d, t),
                     log_cb=lambda m: self.root.after(0, self.log, m),
-                    extract_textures=self.tex_var.get())
+                    extract_textures=self.tex_var.get(),
+                    keep_templates=(self.tmpl_var.get() == 'keep'))
                 detail = ", ".join(f"{k} {v}개" for k, v in
                                    sorted(summary.items(), key=lambda x: -x[1]))
                 self.root.after(0, self.log, f"구성: {detail}")
