@@ -15,7 +15,7 @@ VIRNECT MAKE / ARES (.mars) AR 프로젝트 파일에서 에셋(3D 모델, 이�
 """
 
 # 이 숫자가 자동 업데이트의 기준입니다. 코드를 고칠 때마다 1씩 올리세요.
-APP_VERSION = 2
+APP_VERSION = 3
 
 import os
 import sys
@@ -349,10 +349,142 @@ def extract_mars(mars_path, out_dir, progress_cb=None, log_cb=None, extract_text
 # glTF/GLB (.make / .glb / .gltf) 추출
 # ----------------------------------------------------------------------
 
+def _write_glb(gltf_json, bin_data, out_path):
+    """glTF dict + binary 를 .glb 파일로 기록."""
+    js = json.dumps(gltf_json, ensure_ascii=False).encode('utf-8')
+    while len(js) % 4 != 0:
+        js += b' '
+    bn = bytearray(bin_data)
+    while len(bn) % 4 != 0:
+        bn.append(0)
+    total = 12 + 8 + len(js) + 8 + len(bn)
+    with open(out_path, 'wb') as f:
+        f.write(b'glTF')
+        f.write(struct.pack('<II', 2, total))
+        f.write(struct.pack('<I', len(js)))
+        f.write(b'JSON')
+        f.write(js)
+        f.write(struct.pack('<I', len(bn)))
+        f.write(b'BIN\x00')
+        f.write(bytes(bn))
+
+
+def _build_single_mesh_glb(gltf, bin_data, mesh_idx, node=None):
+    """원본 glTF 에서 mesh_idx 하나만 떼어 독립 glTF dict + binary 생성."""
+    import copy
+    g = {'asset': gltf.get('asset', {'version': '2.0'})}
+    new_bv = []; new_acc = []; new_mat = []; new_tex = []; new_img = []; new_samp = []
+    blob = bytearray()
+    bv_map = {}; acc_map = {}; mat_map = {}; tex_map = {}; img_map = {}; samp_map = {}
+
+    def add_bufferview(bvi):
+        if bvi in bv_map:
+            return bv_map[bvi]
+        bv = gltf['bufferViews'][bvi]
+        off = bv.get('byteOffset', 0); ln = bv['byteLength']
+        while len(blob) % 4 != 0:
+            blob.append(0)
+        new_off = len(blob)
+        blob.extend(bin_data[off:off + ln])
+        nbv = {'buffer': 0, 'byteOffset': new_off, 'byteLength': ln}
+        if 'byteStride' in bv:
+            nbv['byteStride'] = bv['byteStride']
+        if 'target' in bv:
+            nbv['target'] = bv['target']
+        new_bv.append(nbv); bv_map[bvi] = len(new_bv) - 1
+        return bv_map[bvi]
+
+    def add_accessor(ai):
+        if ai in acc_map:
+            return acc_map[ai]
+        a = copy.deepcopy(gltf['accessors'][ai])
+        if a.get('bufferView') is not None:
+            a['bufferView'] = add_bufferview(a['bufferView'])
+        new_acc.append(a); acc_map[ai] = len(new_acc) - 1
+        return acc_map[ai]
+
+    def add_image(ii):
+        if ii in img_map:
+            return img_map[ii]
+        im = copy.deepcopy(gltf['images'][ii])
+        if im.get('bufferView') is not None:
+            im['bufferView'] = add_bufferview(im['bufferView'])
+        new_img.append(im); img_map[ii] = len(new_img) - 1
+        return img_map[ii]
+
+    def add_sampler(si):
+        if si in samp_map:
+            return samp_map[si]
+        new_samp.append(copy.deepcopy(gltf['samplers'][si]))
+        samp_map[si] = len(new_samp) - 1
+        return samp_map[si]
+
+    def add_texture(ti):
+        if ti in tex_map:
+            return tex_map[ti]
+        t = copy.deepcopy(gltf['textures'][ti])
+        if t.get('source') is not None:
+            t['source'] = add_image(t['source'])
+        if t.get('sampler') is not None:
+            t['sampler'] = add_sampler(t['sampler'])
+        new_tex.append(t); tex_map[ti] = len(new_tex) - 1
+        return tex_map[ti]
+
+    def fix_texref(d, key):
+        if key in d and isinstance(d[key], dict) and 'index' in d[key]:
+            d[key]['index'] = add_texture(d[key]['index'])
+
+    def add_material(mi):
+        if mi is None:
+            return None
+        if mi in mat_map:
+            return mat_map[mi]
+        m = copy.deepcopy(gltf['materials'][mi])
+        pbr = m.get('pbrMetallicRoughness', {})
+        fix_texref(pbr, 'baseColorTexture')
+        fix_texref(pbr, 'metallicRoughnessTexture')
+        fix_texref(m, 'normalTexture')
+        fix_texref(m, 'occlusionTexture')
+        fix_texref(m, 'emissiveTexture')
+        new_mat.append(m); mat_map[mi] = len(new_mat) - 1
+        return mat_map[mi]
+
+    src_mesh = gltf['meshes'][mesh_idx]
+    nm = copy.deepcopy(src_mesh)
+    for prim in nm['primitives']:
+        prim['attributes'] = {k: add_accessor(v) for k, v in prim['attributes'].items()}
+        if 'indices' in prim:
+            prim['indices'] = add_accessor(prim['indices'])
+        if prim.get('material') is not None:
+            prim['material'] = add_material(prim['material'])
+
+    g['meshes'] = [nm]
+    g['accessors'] = new_acc
+    g['bufferViews'] = new_bv
+    if new_mat:
+        g['materials'] = new_mat
+    if new_tex:
+        g['textures'] = new_tex
+    if new_img:
+        g['images'] = new_img
+    if new_samp:
+        g['samplers'] = new_samp
+    g['buffers'] = [{'byteLength': len(blob)}]
+    nd = {'mesh': 0, 'name': src_mesh.get('name', 'mesh')}
+    if node:
+        for k in ('translation', 'rotation', 'scale', 'matrix'):
+            if k in node:
+                nd[k] = node[k]
+    g['nodes'] = [nd]
+    g['scenes'] = [{'nodes': [0]}]
+    g['scene'] = 0
+    return g, bytes(blob)
+
+
 def extract_glb(path, out_dir, progress_cb=None, log_cb=None, extract_textures=True):
     """
     VIRNECT XR (.make) = 표준 glTF Binary 컨테이너.
-    임베드된 이미지(텍스처)와 기타 미디어를 추출.
+    모델을 오브젝트(메시)별 .glb 로 분리하고, 텍스처를 이미지로 추출.
     """
     def log(m):
         if log_cb:
@@ -405,15 +537,36 @@ def extract_glb(path, out_dir, progress_cb=None, log_cb=None, extract_textures=T
     images = gltf.get('images', [])
     total = len(images)
 
-    # --- 모델을 실제 3D 파일(.glb)로 저장 ---
-    # 원본이 표준 glTF Binary 이므로 그대로 .glb 로 두면
-    # Blender, Windows 3D 뷰어 등에서 바로 열립니다.
+    # --- 모델을 오브젝트(메시)별 .glb 파일로 분리 저장 ---
+    bin_data = data[bin_off:]
+    meshes = gltf.get('meshes', [])
+    # 각 메시를 처음 참조하는 노드(위치/회전 정보)를 매핑
+    node_of_mesh = {}
+    for nd in gltf.get('nodes', []):
+        mi = nd.get('mesh')
+        if mi is not None and mi not in node_of_mesh:
+            node_of_mesh[mi] = nd
+
     models_dir = os.path.join(out_dir, 'models')
     os.makedirs(models_dir, exist_ok=True)
-    model_name = os.path.splitext(os.path.basename(path))[0] + '.glb'
-    with open(os.path.join(models_dir, model_name), 'wb') as wf:
-        wf.write(data)
-    log(f"모델 저장: models/{model_name}  (메시 {len(gltf.get('meshes', []))}개)")
+    mused = set()
+    model_count = 0
+    log(f"모델 오브젝트 {len(meshes)}개를 개별 파일로 분리 중...")
+    for mi, mesh in enumerate(meshes):
+        try:
+            g, bd = _build_single_mesh_glb(gltf, bin_data, mi, node_of_mesh.get(mi))
+        except Exception as e:
+            log(f"  [건너뜀] 메시 {mi}: {e}")
+            continue
+        nm = mesh.get('name') or f'mesh_{mi}'
+        nm = re.sub(r'[<>:"|?*\\/\x00-\x1f]', '_', str(nm)).strip() or f'mesh_{mi}'
+        fn = f"{mi:03d}_{nm}.glb"
+        while fn.lower() in mused:
+            fn = '_' + fn
+        mused.add(fn.lower())
+        _write_glb(g, bd, os.path.join(models_dir, fn))
+        model_count += 1
+    log(f"모델 {model_count}개 분리 완료 (models 폴더)")
 
     log(f"이미지(텍스처) {total}개 발견. 추출 중...")
 
@@ -422,7 +575,7 @@ def extract_glb(path, out_dir, progress_cb=None, log_cb=None, extract_textures=T
     used = set()
     count = 0
     total_bytes = 0
-    summary = {'.glb': 1}
+    summary = {'.glb(모델)': model_count}
 
     EXT = {'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp'}
 
