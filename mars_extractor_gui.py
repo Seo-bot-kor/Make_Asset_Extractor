@@ -15,7 +15,7 @@ VIRNECT MAKE / ARES (.mars) AR 프로젝트 파일에서 에셋(3D 모델, 이�
 """
 
 # 이 숫자가 자동 업데이트의 기준입니다. 코드를 고칠 때마다 1씩 올리세요.
-APP_VERSION = 4
+APP_VERSION = 5
 
 import os
 import sys
@@ -487,6 +487,175 @@ def _build_single_mesh_glb(gltf, bin_data, mesh_idx, node=None):
     return g, bytes(blob)
 
 
+def _find_import_units(gltf):
+    """씬 노드 트리에서 '임포트 원본 단위'에 해당하는 노드 인덱스 목록 반환."""
+    nodes = gltf.get('nodes', [])
+    if not nodes:
+        return []
+    scene = gltf.get('scenes', [{}])[gltf.get('scene', 0)]
+    roots = scene.get('nodes', list(range(len(nodes))))
+
+    def has_mesh_below(ni):
+        n = nodes[ni]
+        if n.get('mesh') is not None:
+            return True
+        return any(has_mesh_below(c) for c in n.get('children', []))
+
+    # 1순위: ResourceCache 류 루트의 자식 (임포트 원본 캐시)
+    for r in roots:
+        nm = (nodes[r].get('name') or '').lower()
+        if 'resourcecache' in nm or 'cacheroot' in nm:
+            kids = [c for c in nodes[r].get('children', []) if has_mesh_below(c)]
+            if kids:
+                return kids
+    # 2순위: 메시를 가진 최상위 그룹 노드들
+    units = []
+    for r in roots:
+        if not has_mesh_below(r):
+            continue
+        if nodes[r].get('mesh') is not None:
+            units.append(r)
+        else:
+            units.extend(c for c in nodes[r].get('children', []) if has_mesh_below(c))
+    return units
+
+
+def _build_subtree_glb(gltf, bin_data, root_node_idx):
+    """root_node_idx 노드와 그 하위 전체(여러 메시)를 하나의 독립 glTF 로 묶는다."""
+    import copy
+    src_asset = gltf.get('asset', {})
+    g = {'asset': {'version': '2.0'}}
+    if src_asset.get('generator'):
+        g['asset']['generator'] = src_asset['generator']
+
+    new_bv = []; new_acc = []; new_mat = []; new_tex = []
+    new_img = []; new_samp = []; new_mesh = []; new_nodes = []
+    blob = bytearray()
+    bv_map = {}; acc_map = {}; mat_map = {}; tex_map = {}
+    img_map = {}; samp_map = {}; mesh_map = {}
+
+    def add_bv(bvi):
+        if bvi in bv_map:
+            return bv_map[bvi]
+        bv = gltf['bufferViews'][bvi]
+        off = bv.get('byteOffset', 0); ln = bv['byteLength']
+        while len(blob) % 4 != 0:
+            blob.append(0)
+        no = len(blob)
+        blob.extend(bin_data[off:off + ln])
+        nbv = {'buffer': 0, 'byteOffset': no, 'byteLength': ln}
+        if 'byteStride' in bv:
+            nbv['byteStride'] = bv['byteStride']
+        if 'target' in bv:
+            nbv['target'] = bv['target']
+        new_bv.append(nbv); bv_map[bvi] = len(new_bv) - 1
+        return bv_map[bvi]
+
+    def add_acc(ai):
+        if ai in acc_map:
+            return acc_map[ai]
+        a = copy.deepcopy(gltf['accessors'][ai])
+        if a.get('bufferView') is not None:
+            a['bufferView'] = add_bv(a['bufferView'])
+        new_acc.append(a); acc_map[ai] = len(new_acc) - 1
+        return acc_map[ai]
+
+    def add_img(ii):
+        if ii in img_map:
+            return img_map[ii]
+        im = copy.deepcopy(gltf['images'][ii])
+        if im.get('bufferView') is not None:
+            im['bufferView'] = add_bv(im['bufferView'])
+        new_img.append(im); img_map[ii] = len(new_img) - 1
+        return img_map[ii]
+
+    def add_samp(si):
+        if si in samp_map:
+            return samp_map[si]
+        new_samp.append(copy.deepcopy(gltf['samplers'][si]))
+        samp_map[si] = len(new_samp) - 1
+        return samp_map[si]
+
+    def add_tex(ti):
+        if ti in tex_map:
+            return tex_map[ti]
+        t = copy.deepcopy(gltf['textures'][ti])
+        if t.get('source') is not None:
+            t['source'] = add_img(t['source'])
+        if t.get('sampler') is not None:
+            t['sampler'] = add_samp(t['sampler'])
+        new_tex.append(t); tex_map[ti] = len(new_tex) - 1
+        return tex_map[ti]
+
+    def fixt(d, k):
+        if k in d and isinstance(d[k], dict) and 'index' in d[k]:
+            d[k]['index'] = add_tex(d[k]['index'])
+
+    def add_mat(mi):
+        if mi is None:
+            return None
+        if mi in mat_map:
+            return mat_map[mi]
+        m = copy.deepcopy(gltf['materials'][mi])
+        pbr = m.get('pbrMetallicRoughness', {})
+        fixt(pbr, 'baseColorTexture')
+        fixt(pbr, 'metallicRoughnessTexture')
+        fixt(m, 'normalTexture')
+        fixt(m, 'occlusionTexture')
+        fixt(m, 'emissiveTexture')
+        new_mat.append(m); mat_map[mi] = len(new_mat) - 1
+        return mat_map[mi]
+
+    def add_mesh(mi):
+        if mi in mesh_map:
+            return mesh_map[mi]
+        m = copy.deepcopy(gltf['meshes'][mi])
+        for prim in m['primitives']:
+            prim['attributes'] = {k: add_acc(v) for k, v in prim['attributes'].items()}
+            if 'indices' in prim:
+                prim['indices'] = add_acc(prim['indices'])
+            if prim.get('material') is not None:
+                prim['material'] = add_mat(prim['material'])
+        new_mesh.append(m); mesh_map[mi] = len(new_mesh) - 1
+        return mesh_map[mi]
+
+    def add_node(ni):
+        src = gltf['nodes'][ni]
+        local = len(new_nodes)
+        new_nodes.append({})  # 자리 예약
+        nd = {}
+        if src.get('name'):
+            nd['name'] = src['name']
+        for k in ('translation', 'rotation', 'scale', 'matrix'):
+            if k in src:
+                nd[k] = src[k]
+        if src.get('mesh') is not None:
+            nd['mesh'] = add_mesh(src['mesh'])
+        kids = [add_node(c) for c in src.get('children', [])]
+        if kids:
+            nd['children'] = kids
+        new_nodes[local] = nd
+        return local
+
+    root_local = add_node(root_node_idx)
+    g['nodes'] = new_nodes
+    g['meshes'] = new_mesh
+    g['accessors'] = new_acc
+    g['bufferViews'] = new_bv
+    if new_mat:
+        g['materials'] = new_mat
+    if new_tex:
+        g['textures'] = new_tex
+    if new_img:
+        g['images'] = new_img
+    if new_samp:
+        g['samplers'] = new_samp
+    g['buffers'] = [{'byteLength': len(blob)}]
+    g['scenes'] = [{'nodes': [root_local]}]
+    g['scene'] = 0
+    return g, bytes(blob)
+
+
 def extract_glb(path, out_dir, progress_cb=None, log_cb=None, extract_textures=True):
     """
     VIRNECT XR (.make) = 표준 glTF Binary 컨테이너.
@@ -561,9 +730,9 @@ def extract_glb(path, out_dir, progress_cb=None, log_cb=None, extract_textures=T
     model_count = 0
     plane_count = 0
     acc = gltf.get('accessors', [])
+    nodes = gltf.get('nodes', [])
 
-    def is_flat_plane(mesh):
-        """정점 4개·삼각형 2개짜리 단일 면 = UI/이미지/영상용 평면."""
+    def mesh_is_flat(mesh):
         prims = mesh.get('primitives', [])
         if len(prims) != 1:
             return False
@@ -574,26 +743,45 @@ def extract_glb(path, out_dir, progress_cb=None, log_cb=None, extract_textures=T
         itot = acc[prims[0]['indices']]['count'] if 'indices' in prims[0] else 0
         return vtot == 4 and itot // 3 == 2
 
-    log(f"모델 오브젝트 {len(meshes)}개 분리 중 (3D 형상 / 이미지 평면 구분)...")
-    for mi, mesh in enumerate(meshes):
-        try:
-            g, bd = _build_single_mesh_glb(gltf, bin_data, mi, node_of_mesh.get(mi))
-        except Exception as e:
-            log(f"  [건너뜀] 메시 {mi}: {e}")
-            continue
-        nm = mesh.get('name') or f'mesh_{mi}'
-        nm = re.sub(r'[<>:"|?*\\/\x00-\x1f]', '_', str(nm)).strip() or f'mesh_{mi}'
+    def unit_meshes(ni):
+        out = []
+        n = nodes[ni]
+        if n.get('mesh') is not None:
+            out.append(n['mesh'])
+        for c in n.get('children', []):
+            out.extend(unit_meshes(c))
+        return out
 
-        if is_flat_plane(mesh):
+    def unit_is_all_flat(ni):
+        ms = unit_meshes(ni)
+        return len(ms) > 0 and all(mesh_is_flat(meshes[m]) for m in ms)
+
+    # 임포트 원본 단위(노드 서브트리)로 묶어서 추출
+    units = _find_import_units(gltf)
+    if not units:
+        # 폴백: 노드 정보가 빈약하면 메시 단위로라도 추출
+        units = [None]
+    log(f"임포트 단위 {len(units)}개로 묶어서 추출 중...")
+
+    for ui in units:
+        try:
+            g, bd = _build_subtree_glb(gltf, bin_data, ui)
+        except Exception as e:
+            log(f"  [건너뜀] 노드 {ui}: {e}")
+            continue
+        nm = (nodes[ui].get('name') if ui is not None else None) or f'unit_{ui}'
+        nm = re.sub(r'[<>:"|?*\\/\x00-\x1f]', '_', str(nm)).strip() or f'unit_{ui}'
+
+        if ui is not None and unit_is_all_flat(ui):
             os.makedirs(planes_dir, exist_ok=True)
-            fn = f"{mi:03d}_{nm}.glb"
+            fn = f"{nm}.glb"
             while fn.lower() in pused:
                 fn = '_' + fn
             pused.add(fn.lower())
             _write_glb(g, bd, os.path.join(planes_dir, fn))
             plane_count += 1
         else:
-            fn = f"{mi:03d}_{nm}.glb"
+            fn = f"{nm}.glb"
             while fn.lower() in mused:
                 fn = '_' + fn
             mused.add(fn.lower())
