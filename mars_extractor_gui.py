@@ -15,7 +15,7 @@ VIRNECT MAKE / ARES (.mars) AR 프로젝트 파일에서 에셋(3D 모델, 이�
 """
 
 # 이 숫자가 자동 업데이트의 기준입니다. 코드를 고칠 때마다 1씩 올리세요.
-APP_VERSION = 7
+APP_VERSION = 8
 
 import os
 import sys
@@ -927,20 +927,52 @@ def extract_glb(path, out_dir, progress_cb=None, log_cb=None, extract_textures=T
     return count, total_bytes, summary
 
 
+def _extract_template_assets(path, out_dir, log_cb=None, extract_textures=True):
+    """하나의 .makeTemplate(GLB) 안의 에셋을 templates/<이름>/ 아래로 추출."""
+    name = os.path.splitext(os.path.basename(path))[0]
+    safe = re.sub(r'[<>:"|?*\\/\x00-\x1f]', '_', name).strip() or 'template'
+    sub = os.path.join(out_dir, 'templates', safe)
+    os.makedirs(sub, exist_ok=True)
+    # 원본도 그대로 함께 보관
+    import shutil
+    shutil.copy2(path, os.path.join(sub, os.path.basename(path)))
+    # GLB 면 내부 에셋 추출
+    with open(path, 'rb') as f:
+        head = f.read(4)
+    if head == b'glTF':
+        try:
+            return extract_glb(path, sub, None, log_cb, extract_textures)
+        except Exception as e:
+            if log_cb:
+                log_cb(f"  템플릿 에셋 추출 실패({os.path.basename(path)}): {e}")
+            return (1, os.path.getsize(path), {'.makeTemplate': 1})
+    return (1, os.path.getsize(path), {'.makeTemplate': 1})
+
+
 def extract_any(path, out_dir, progress_cb=None, log_cb=None,
-                extract_textures=True, keep_templates=True):
-    """확장자/매직으로 .mars / .make / .MakeTemplate 자동 판별 후 처리."""
-    # .MakeTemplate 를 직접 넣은 경우: 원형 그대로 templates/ 에 보관
+                extract_textures=True, keep_templates=True, template_mode='keep'):
+    """확장자/매직으로 .mars / .make / .makeTemplate 자동 판별 후 처리.
+
+    template_mode:
+      'keep'    : .makeTemplate 를 원형 그대로 templates/ 에 보관
+      'extract' : .makeTemplate 마다 templates/<이름>/ 폴더를 만들어
+                  원본 + 내부 에셋(이미지/모델 등)을 함께 추출
+    """
+    # .makeTemplate 를 직접 넣은 경우
     if path.lower().endswith('.maketemplate'):
+        if template_mode == 'extract':
+            if log_cb:
+                log_cb(f".makeTemplate 에셋 추출: {os.path.basename(path)}")
+            return _extract_template_assets(path, out_dir, log_cb, extract_textures)
+        # keep: 원형 그대로 보관
         import shutil
         tdir = os.path.join(out_dir, 'templates')
         os.makedirs(tdir, exist_ok=True)
         fn = os.path.basename(path)
         shutil.copy2(path, os.path.join(tdir, fn))
         if log_cb:
-            log_cb(f".MakeTemplate 원형 보관: templates/{fn}")
-        size = os.path.getsize(path)
-        return (1, size, {'.MakeTemplate': 1})
+            log_cb(f".makeTemplate 원형 보관: templates/{fn}")
+        return (1, os.path.getsize(path), {'.makeTemplate': 1})
 
     with open(path, 'rb') as f:
         head = f.read(4)
@@ -948,12 +980,23 @@ def extract_any(path, out_dir, progress_cb=None, log_cb=None,
         result = extract_glb(path, out_dir, progress_cb, log_cb, extract_textures)
     else:
         result = extract_mars(path, out_dir, progress_cb, log_cb, extract_textures)
-    # 입력 파일과 같은 폴더에 .MakeTemplate 가 있으면 함께 원형 보관
+    # 입력 파일과 같은 폴더에 .makeTemplate 가 있으면 모드에 따라 처리
     if keep_templates:
-        n = copy_sidecar_templates(path, out_dir, log_cb)
-        if n:
+        src_dir = os.path.dirname(os.path.abspath(path))
+        try:
+            tmpls = [n for n in os.listdir(src_dir) if n.lower().endswith('.maketemplate')]
+        except Exception:
+            tmpls = []
+        if tmpls:
             count, total_bytes, summary = result
-            summary['.MakeTemplate'] = n
+            if template_mode == 'extract':
+                for n in tmpls:
+                    _extract_template_assets(os.path.join(src_dir, n),
+                                             out_dir, log_cb, extract_textures)
+                summary['.makeTemplate(추출)'] = len(tmpls)
+            else:
+                copy_sidecar_templates(path, out_dir, log_cb)
+                summary['.makeTemplate'] = len(tmpls)
             result = (count, total_bytes, summary)
     return result
 
@@ -1026,15 +1069,17 @@ class App:
                        variable=self.tex_var,
                        font=("Malgun Gothic", 9)).pack(pady=(2, 0))
 
-        # 옵션: .MakeTemplate 처리 방식
+        # 옵션: .makeTemplate 처리 방식
         self.tmpl_var = tk.StringVar(value='keep')
         tf = tk.Frame(root)
         tf.pack(pady=(0, 2))
-        tk.Label(tf, text=".MakeTemplate:", font=("Malgun Gothic", 9)).grid(row=0, column=0, padx=(0, 6))
-        tk.Radiobutton(tf, text="원형 그대로 보관", value='keep',
+        tk.Label(tf, text=".makeTemplate:", font=("Malgun Gothic", 9)).grid(row=0, column=0, padx=(0, 6))
+        tk.Radiobutton(tf, text="원형 보관", value='keep',
                        variable=self.tmpl_var, font=("Malgun Gothic", 9)).grid(row=0, column=1)
-        tk.Radiobutton(tf, text="보관 안 함", value='skip',
+        tk.Radiobutton(tf, text="폴더별 에셋 추출", value='extract',
                        variable=self.tmpl_var, font=("Malgun Gothic", 9)).grid(row=0, column=2)
+        tk.Radiobutton(tf, text="안 함", value='skip',
+                       variable=self.tmpl_var, font=("Malgun Gothic", 9)).grid(row=0, column=3)
 
         # 진행률
         self.progress = ttk.Progressbar(root, length=520, mode="determinate")
@@ -1095,7 +1140,8 @@ class App:
                     progress_cb=lambda d, t: self.root.after(0, self.set_progress, d, t),
                     log_cb=lambda m: self.root.after(0, self.log, m),
                     extract_textures=self.tex_var.get(),
-                    keep_templates=(self.tmpl_var.get() == 'keep'))
+                    keep_templates=(self.tmpl_var.get() != 'skip'),
+                    template_mode=self.tmpl_var.get())
                 detail = ", ".join(f"{k} {v}개" for k, v in
                                    sorted(summary.items(), key=lambda x: -x[1]))
                 self.root.after(0, self.log, f"구성: {detail}")
